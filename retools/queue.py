@@ -101,7 +101,7 @@ import time
 import uuid
 from datetime import datetime
 from optparse import OptionParser
-
+import random
 import pkg_resources
 
 try:
@@ -118,7 +118,10 @@ from retools.util import with_nested_contexts
 
 class QueueManager(object):
     """Configures and enqueues jobs"""
-    def __init__(self, redis=None, default_queue_name='main'):
+
+    metadata_attr = "_job_metadata"
+
+    def __init__(self, redis=None, default_queue_name='main', subscribers=None):
         """Initialize a QueueManager
 
         :param redis: A Redis instance. Defaults to the redis instance
@@ -126,10 +129,34 @@ class QueueManager(object):
         """
         self.default_queue_name = default_queue_name
         self.redis = redis or global_connection.redis
+        self.subscribers = subscribers and subscribers or {}
         self.names = {}  # cache name lookups
         self.job_config = {}
         self.job_events = {}
         self.global_events = {}
+
+    def set_subscribers(self, subscribers):
+        """
+        Bulk register subscribers
+
+        :param subscribers: A mapping that has keys which strings
+                            equal to event names or tuples of event
+                            name strings and job specifiers 
+                            
+        Example::                            
+
+          >>> subscribers = {'job_failure':'mypackage.jobs:save_error',
+          ...  ('job_postrun', 'mypackage.jobs:important'):'my_event_handler'}
+          >>> qm.set_subscribers(subscribers)
+        """
+        for event, handler in subscribers.items():
+            if isinstance(event, basestring):
+                self.subscriber(event, handler)
+            elif isinstance(event, tuple):
+                event, job = event
+                self.subscriber(event, job, handler) 
+            else:
+                raise ValueError("Type(%s) not supported as an event: %s" %(type(event), event))
 
     def set_queue_for_job(self, job_name, queue_name):
         """Set the queue that a given job name will go to
@@ -148,6 +175,8 @@ class QueueManager(object):
         :param job: Optional, a specific job to bind to.
         :param handler: The location of the handler to call.
 
+
+
         """
         if job:
             job_events = self.job_events.setdefault(job, {})
@@ -165,6 +194,7 @@ class QueueManager(object):
         :returns: The job id that was queued.
 
         """
+        #@@ deal with appended metadata
         if job not in self.names:
             job_func = pkg_resources.EntryPoint.parse('x=%s' % job).load(False)
             self.names[job] = job_func
@@ -376,8 +406,9 @@ class Worker(object):
                     else:
                         self.set_proc_title("Processing %s since %s" % (
                             self.job.queue_name, datetime.now()))
+                        random.seed()
                         self.perform()
-                        sys.exit()
+                        os._exit(0)
                     self.done_working()
                     self.child_id = None
                     self.job = None
@@ -512,20 +543,25 @@ class Worker(object):
         """Run the job and call the appropriate signal handlers"""
         self.job.perform()
 
+    @classmethod
+    def run(cls):
+        usage = "usage: %prog queues"
+        parser = OptionParser(usage=usage)
+        parser.add_option("--interval", dest="interval", type="int", default=5,
+                          help="Polling interval")
+        parser.add_option("-b", dest="blocking", action="store_true",
+                          default=False,
+                          help="Whether to use blocking queue semantics")
 
-def run_worker():
-    usage = "usage: %prog queues"
-    parser = OptionParser(usage=usage)
-    parser.add_option("--interval", dest="interval", type="int", default=5,
-                      help="Polling interval")
-    parser.add_option("-b", dest="blocking", action="store_true",
-                      default=False,
-                      help="Whether to use blocking queue semantics")
-    (options, args) = parser.parse_args()
+        (options, args) = parser.parse_args()
 
-    if len(args) < 1:
-        sys.exit("Error: Failed to provide queues or packages_to_scan args")
+        if len(args) < 1:
+            sys.exit("Error: Failed to provide queues or packages_to_scan args")
 
-    worker = Worker(queues=args[0].split(','))
-    worker.work(interval=options.interval, blocking=options.blocking)
-    sys.exit()
+        worker = cls(queues=args[0].split(','))
+        worker.work(interval=options.interval, blocking=options.blocking)
+        sys.exit()
+
+
+run_worker = Worker.run
+
