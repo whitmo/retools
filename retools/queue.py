@@ -103,6 +103,8 @@ from datetime import datetime
 from optparse import OptionParser
 import random
 import pkg_resources
+#import logging
+
 
 try:
     import json
@@ -111,15 +113,20 @@ except ImportError:  # pragma: nocover
 
 from setproctitle import setproctitle
 
-from retools import global_connection
-from retools.exc import ConfigurationError
-from retools.util import with_nested_contexts
+from . import global_connection
+from .exc import ConfigurationError
+from .resolve import DottedNameResolver
+from .util import with_nested_contexts
+
+
+resolve = DottedNameResolver(None).maybe_resolve
 
 
 class QueueManager(object):
     """Configures and enqueues jobs"""
 
     metadata_attr = "_job_metadata"
+    resolve = staticmethod(resolve)
 
     def __init__(self, redis=None, default_queue_name='main', subscribers=None):
         """Initialize a QueueManager
@@ -129,11 +136,11 @@ class QueueManager(object):
         """
         self.default_queue_name = default_queue_name
         self.redis = redis or global_connection.redis
-        self.subscribers = subscribers and subscribers or {}
         self.names = {}  # cache name lookups
         self.job_config = {}
         self.job_events = {}
         self.global_events = {}
+        self.set_subscribers(subscribers or {})
 
     def set_subscribers(self, subscribers):
         """
@@ -151,7 +158,7 @@ class QueueManager(object):
         """
         for event, handler in subscribers.items():
             if isinstance(event, basestring):
-                self.subscriber(event, handler)
+                self.subscriber(event, handler=handler)
             elif isinstance(event, tuple):
                 event, job = event
                 self.subscriber(event, job, handler) 
@@ -174,15 +181,14 @@ class QueueManager(object):
         :param event: The name of the event to subscribe to.
         :param job: Optional, a specific job to bind to.
         :param handler: The location of the handler to call.
-
-
-
         """
         if job:
             job_events = self.job_events.setdefault(job, {})
-            job_events.setdefault(event, []).append(handler)
+            if handler not in set(job_events.setdefault(event, [])):
+                job_events[event].append(handler)
         else:
-            self.global_events.setdefault(event, []).append(handler)
+            if handler not in set(self.global_events.setdefault(event, [])):
+                self.global_events[event].append(handler)
 
     def enqueue(self, job, **kwargs):
         """Enqueue a job
@@ -194,9 +200,8 @@ class QueueManager(object):
         :returns: The job id that was queued.
 
         """
-        #@@ deal with appended metadata
         if job not in self.names:
-            job_func = pkg_resources.EntryPoint.parse('x=%s' % job).load(False)
+            job_func = self.resolve(job)
             self.names[job] = job_func
 
         queue_name = kwargs.pop('queue_name', None)
@@ -301,7 +306,7 @@ class Job(object):
         self.run_event('job_prerun')
         try:
             if 'job_wrapper' in self.events:
-                result = with_nested_contexts(self.events['job_wrapper'],
+                result = with_nested_contexts(set(self.events['job_wrapper']),
                                               self.func, [self], self.kwargs)
             else:
                 result = self.func(**self.kwargs)
@@ -336,6 +341,9 @@ class Job(object):
 
 class Worker(object):
     """A Worker works on jobs"""
+
+    resolve = staticmethod(resolve)
+
     def __init__(self, queues, redis=None):
         """Create a worker
 
@@ -443,10 +451,7 @@ class Worker(object):
         try:
             job.func = self.jobs[job.job_name]
         except KeyError:
-            mod_name, func_name = job.job_name.split(':')
-            __import__(mod_name)
-            mod = sys.modules[mod_name]
-            job.func = self.jobs[job.job_name] = getattr(mod, func_name)
+            job.func = self.jobs[job.job_name] = self.resolve(job.job_name)
         return True
 
     def set_proc_title(self, title):
@@ -541,10 +546,16 @@ class Worker(object):
 
     def perform(self):
         """Run the job and call the appropriate signal handlers"""
+        self.job.worker = self
         self.job.perform()
+
+    # def logging_setup(self, loglevel=logging.INFO):
+    #     logging.basicConfig(level=loglevel,
+    #                         format='[%(levelname)s:%(name)s] %(message)s')
 
     @classmethod
     def run(cls):
+        #@@ convert to arg parse
         usage = "usage: %prog queues"
         parser = OptionParser(usage=usage)
         parser.add_option("--interval", dest="interval", type="int", default=5,
@@ -559,7 +570,12 @@ class Worker(object):
             sys.exit("Error: Failed to provide queues or packages_to_scan args")
 
         worker = cls(queues=args[0].split(','))
-        worker.work(interval=options.interval, blocking=options.blocking)
+        #worker.logging_setup()
+        try:
+            print "starting worker"
+            worker.work(interval=options.interval, blocking=options.blocking)
+        except :
+            import pdb; pdb.post_mortem(sys.exc_info()[2])
         sys.exit()
 
 
